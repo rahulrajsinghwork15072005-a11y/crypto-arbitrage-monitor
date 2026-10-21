@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Crypto Arbitrage Monitor</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root { --bg:#0b0e14; --panel:#141a23; --ink:#e6edf3; --muted:#8b98a5; --accent:#f7a600; --pos:#3fb950; --neg:#f85149; }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,Segoe UI,Roboto,sans-serif; }
+    header { padding:16px 24px; border-bottom:1px solid #222c38; }
+    h1 { margin:0; font-size:20px; } .sub { color:var(--muted); font-size:13px; margin-top:4px; }
+    .warn { background:rgba(247,166,0,.12); border:1px solid rgba(247,166,0,.4); color:#f7c860; padding:8px 12px; border-radius:8px; margin:12px 24px; font-size:12.5px; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:4px 24px 24px; }
+    .card { background:var(--panel); border:1px solid #222c38; border-radius:10px; padding:14px; } .full { grid-column:1/-1; }
+    .card h2 { font-size:14px; margin:0 0 10px; color:var(--accent); font-weight:600; }
+    table { width:100%; border-collapse:collapse; font-size:12.5px; } th,td { text-align:right; padding:6px 8px; border-bottom:1px solid #222c38; } th:first-child,td:first-child{ text-align:left; } th { color:var(--muted); font-weight:500; }
+    .pos { color:var(--pos); } .neg { color:var(--neg); } .plot { width:100%; height:300px; }
+    .ladders { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
+    .lad h3 { font-size:13px; margin:0 0 6px; } .lad .mid { color:var(--muted); font-size:11px; }
+    .stat { display:inline-block; margin-right:16px; font-size:13px; } .stat b{ color:var(--ink);} .stat span{ color:var(--muted);}
+    button { background:#0d1117; color:var(--ink); border:1px solid #30363d; border-radius:6px; padding:6px 10px; cursor:pointer; font-size:12.5px;} button:hover{ border-color:var(--accent);}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Crypto Arbitrage Monitor</h1>
+    <div class="sub">Streams normalized books, computes fee- &amp; slippage-adjusted spreads, filters by liquidity, tracks edge decay.</div>
+  </header>
+  <div class="warn"><b>Monitoring / analytics only.</b> Theoretical spreads net of fees and book slippage. Not trading advice; no orders are placed. Latency, withdrawal limits, and market movement routinely erase raw spreads.</div>
+
+  <div class="grid">
+    <div class="card full">
+      <h2>Live order books <button onclick="refresh()" style="float:right">Refresh</button></h2>
+      <div id="ladders" class="ladders"></div>
+    </div>
+
+    <div class="card full">
+      <h2>Detected opportunities (fee + slippage adjusted)</h2>
+      <div id="oppStat"></div>
+      <table id="oppTable"><thead><tr><th>Buy</th><th>Sell</th><th>Gross bps</th><th>Net bps</th><th>Max size</th><th>Est. profit</th><th>Buy slip bps</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <h2>Triangular cycle (single venue)</h2>
+      <div style="margin-bottom:8px"><button onclick="loadTri(true)">Profitable</button> <button onclick="loadTri(false)">Balanced</button></div>
+      <div id="triOut"></div>
+    </div>
+
+    <div class="card">
+      <h2>Latency by venue</h2>
+      <div id="latPlot" class="plot"></div>
+    </div>
+
+    <div class="card full">
+      <h2>Opportunity net spread &amp; decay</h2>
+      <div id="histStat"></div>
+      <div id="histPlot" class="plot"></div>
+    </div>
+  </div>
+
+<script>
+const LAYOUT={paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'#e6edf3',size:11},margin:{l:48,r:16,t:10,b:36},xaxis:{gridcolor:'#222c38'},yaxis:{gridcolor:'#222c38'},showlegend:true,legend:{orientation:'h'}};
+const CFG={displayModeBar:false,responsive:true};
+const api=p=>fetch(p).then(r=>r.json());
+const bps=x=>(x*1e4).toFixed(1);
+
+async function loadBooks(){
+  const d=await api('/api/demo/books');
+  document.getElementById('ladders').innerHTML=Object.entries(d.books).map(([v,b])=>{
+    const rows=[];
+    for(let i=4;i>=0;i--){ const a=b.asks[i]; rows.push(`<tr><td class="neg">${a[0].toLocaleString()}</td><td>${a[1]}</td></tr>`); }
+    rows.push(`<tr><td colspan="2" class="mid">— mid ${b.mid.toLocaleString(undefined,{maximumFractionDigits:2})} —</td></tr>`);
+    for(let i=0;i<5;i++){ const x=b.bids[i]; rows.push(`<tr><td class="pos">${x[0].toLocaleString()}</td><td>${x[1]}</td></tr>`); }
+    return `<div class="lad"><h3>${v}</h3><table>${rows.join('')}</table></div>`;
+  }).join('');
+}
+
+async function loadOpps(){
+  const d=await api('/api/demo/opportunities');
+  const tb=document.querySelector('#oppTable tbody');
+  if(!d.opportunities.length){ tb.innerHTML=`<tr><td colspan="7" class="mid">No opportunities above ${bps(d.threshold)} bps right now.</td></tr>`; document.getElementById('oppStat').innerHTML=''; return; }
+  document.getElementById('oppStat').innerHTML=`<span class="stat"><span>found:</span> <b>${d.opportunities.length}</b></span><span class="stat"><span>threshold:</span> <b>${bps(d.threshold)} bps</b></span>`;
+  tb.innerHTML=d.opportunities.map(o=>`<tr><td>${o.buy_venue}</td><td>${o.sell_venue}</td><td>${bps(o.gross_spread)}</td><td class="pos">${bps(o.net_spread)}</td><td>${o.max_size.toFixed(3)}</td><td class="pos">$${o.est_profit.toFixed(2)}</td><td>${bps(o.buy_slippage)}</td></tr>`).join('');
+}
+
+async function loadTri(profitable){
+  const d=await api('/api/demo/triangular?profitable='+profitable);
+  document.getElementById('triOut').innerHTML=
+    `<div class="stat"><span>cycle:</span> <b>${d.legs.join('  →  ')}</b></div><br>`+
+    `<span class="stat"><span>net return:</span> <b class="${d.net_return>0?'pos':'neg'}">${(d.net_return*100).toFixed(3)}%</b></span>`+
+    `<span class="stat"><span>opportunity:</span> <b class="${d.is_opportunity?'pos':'neg'}">${d.is_opportunity?'YES':'no'}</b></span>`;
+}
+
+async function loadLatency(){
+  const d=await api('/api/demo/latency');
+  const venues=Object.keys(d);
+  const traces=[
+    {x:venues,y:venues.map(v=>d[v].p50*1000),name:'p50 ms',type:'bar',marker:{color:'#4da3ff'}},
+    {x:venues,y:venues.map(v=>d[v].p95*1000),name:'p95 ms',type:'bar',marker:{color:'#f7a600'}},
+  ];
+  Plotly.newPlot('latPlot',traces,Object.assign({},LAYOUT,{yaxis:{title:'ms',gridcolor:'#222c38'}}),CFG);
+}
+
+async function loadHistory(){
+  const d=await api('/api/demo/history');
+  document.getElementById('histStat').innerHTML=
+    `<span class="stat"><span>decay &lambda;:</span> <b>${d.decay_rate.toFixed(3)}/s</b></span>`+
+    `<span class="stat"><span>half-life:</span> <b>${isFinite(d.half_life)?d.half_life.toFixed(2)+'s':'&infin;'}</b></span>`+
+    `<span class="stat"><span>edge lifetime:</span> <b>${d.lifetime.toFixed(1)}s</b></span>`;
+  const obs={x:d.t,y:d.net_spread.map(bps),name:'net spread (bps)',mode:'markers',type:'scatter',marker:{color:'#4da3ff',size:6}};
+  const fit={x:d.t,y:d.t.map(t=>d.s0*Math.exp(-d.decay_rate*t)*1e4),name:'decay fit',type:'scatter',line:{color:'#f7a600'}};
+  const thr={x:d.t,y:d.t.map(()=>d.threshold*1e4),name:'threshold',type:'scatter',line:{color:'#f85149',dash:'dash'}};
+  Plotly.newPlot('histPlot',[obs,fit,thr],Object.assign({},LAYOUT,{yaxis:{title:'bps',gridcolor:'#222c38'},xaxis:{title:'seconds',gridcolor:'#222c38'}}),CFG);
+}
+
+function refresh(){ loadBooks(); loadOpps(); }
+refresh(); loadTri(true); loadLatency(); loadHistory();
+</script>
+</body>
+</html>
